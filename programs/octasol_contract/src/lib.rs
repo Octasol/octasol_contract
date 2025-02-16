@@ -89,6 +89,38 @@ pub mod octasol_contract {
 
         Ok(())
     }
+
+    pub fn cancel_bounty(ctx: Context<CancelBounty>) -> Result<()> {
+        let bounty = &mut ctx.accounts.bounty;
+        require!(
+            bounty.state == BountyState::Created || bounty.state == BountyState::InProgress,
+            BountyError::InvalidBountyState
+        );
+
+        // Transfer tokens back to maintainer
+        let transfer_instruction = Transfer {
+            from: ctx.accounts.escrow_token_account.to_account_info(),
+            to: ctx.accounts.maintainer_token_account.to_account_info(),
+            authority: bounty.to_account_info(),
+        };
+
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                transfer_instruction,
+                &[&[
+                    b"bounty".as_ref(),
+                    bounty.bounty_id.to_le_bytes().as_ref(),
+                    &[ctx.bumps.bounty],
+                ]],
+            ),
+            bounty.amount,
+        )?;
+
+        bounty.state = BountyState::Cancelled;
+
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -181,6 +213,37 @@ pub struct CompleteBounty<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+pub struct CancelBounty<'info> {
+    #[account(
+        mut,
+        has_one = maintainer,
+        seeds = [b"bounty".as_ref(), bounty.bounty_id.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub bounty: Account<'info, Bounty>,
+
+    #[account(mut)]
+    pub maintainer: Signer<'info>,
+
+    pub mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = bounty,
+    )]
+    pub escrow_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = maintainer,
+    )]
+    pub maintainer_token_account: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
 
 #[account]
 pub struct Bounty {
