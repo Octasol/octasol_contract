@@ -1,284 +1,283 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
-use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token::{transfer,Transfer};
+use anchor_spl::token::{close_account, CloseAccount};
+
+
+pub mod context;
+pub mod state;
+pub mod util;
+
+use context::*;
+use state::*;
+use util::{errors::ContractError, events::*};
+
 
 declare_id!("tMf5EmV2h6sMJ2QMFU6766ACJpf7NTuamPzCudaNFus");
 
+
+
+
 #[program]
 pub mod octasol_contract {
+
+
     use super::*;
+
+
+
+    pub fn initialize_config(ctx: Context<InitializeConfig>) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        config.admin = ctx.accounts.admin.key(); // Set the initial admin
+        config.bump = ctx.bumps.config;
+        Ok(())
+    }
 
     pub fn initialize_bounty(
         ctx: Context<InitializeBounty>,
         bounty_id: u64,
         amount: u64,
-        github_issue_id: u64,
-        maintainer_github_id: u64,
     ) -> Result<()> {
+        require!(amount > 0, ContractError::InvalidAmount);
+
         let bounty = &mut ctx.accounts.bounty;
         bounty.maintainer = ctx.accounts.maintainer.key();
+        bounty.contributor = None;
+        bounty.mint = ctx.accounts.mint.key();
         bounty.amount = amount;
-        bounty.github_issue_id = github_issue_id;
-        bounty.maintainer_github_id = maintainer_github_id;
-        bounty.state = BountyState::Created;
+        bounty.bump = ctx.bumps.escrow_authority;
         bounty.bounty_id = bounty_id;
+        bounty.state = BountyState::Created;
 
-        // Transfer tokens from maintainer to escrow account
-        let transfer_instruction = Transfer {
+        // Transfer tokens from maintainer to escrow
+        let cpi_accounts = Transfer {
             from: ctx.accounts.maintainer_token_account.to_account_info(),
             to: ctx.accounts.escrow_token_account.to_account_info(),
             authority: ctx.accounts.maintainer.to_account_info(),
         };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        let _ =transfer(cpi_ctx, amount)?;
 
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                transfer_instruction,
-            ),
+        emit!(BountyCreated {
+            bounty_id,
+            maintainer: ctx.accounts.maintainer.key(),
             amount,
-        )?;
+        });
 
         Ok(())
     }
 
-    pub fn assign_contributor(
-        ctx: Context<AssignContributor>,
-        contributor_github_id: u64,
-    ) -> Result<()> {
+pub fn assign_contributor(ctx: Context<AssignContributor>) -> Result<()> {
+    let bounty = &mut ctx.accounts.bounty;
+
+    // Security checks
+    require!(bounty.state == BountyState::Created, ContractError::InvalidBountyStateForOperation);
+    require!(bounty.contributor.is_none(), ContractError::ContributorAlreadyAssigned);
+    require!(bounty.maintainer == ctx.accounts.maintainer.key(), ContractError::MaintainerMismatch);
+
+    let contributor_key = ctx.accounts.contributor.key();
+
+    bounty.contributor = Some(contributor_key);
+    bounty.state = BountyState::InProgress;
+
+    emit!(ContributorAssigned {
+        bounty_id: bounty.bounty_id,
+        contributor: contributor_key,
+    });
+
+    Ok(())
+}
+
+
+    // Maintainer completes bounty and pays contributor
+    pub fn complete_bounty(ctx: Context<CompleteBounty>,bounty_id:u64) -> Result<()> {
         let bounty = &mut ctx.accounts.bounty;
-        require!(
-            bounty.state == BountyState::Created,
-            BountyError::InvalidBountyState
+        
+        // Security checks
+        require!(bounty.bounty_id == bounty_id, ContractError::InvalidBountyState);
+        require!(bounty.state == BountyState::InProgress, ContractError::InvalidBountyStateForOperation);
+        require!(bounty.contributor.is_some(), ContractError::InvalidContributor);
+        require!(bounty.contributor.unwrap() == ctx.accounts.contributor.key(), ContractError::InvalidContributor);
+        require!(bounty.mint == ctx.accounts.contributor_token_account.mint, ContractError::InvalidMint);
+        require!(bounty.mint == ctx.accounts.escrow_token_account.mint, ContractError::InvalidMint);
+      
+        let bounty_key = bounty.key();
+        let bump = bounty.bump;
+        let seeds = &[b"escrow_auth",bounty_key.as_ref(),&[bump]];
+        let binding = &[&seeds[..]];
+
+        let cpi_ctx = CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), Transfer{
+            from:ctx.accounts.escrow_token_account.to_account_info(),
+            to:ctx.accounts.contributor_token_account.to_account_info(),
+            authority:ctx.accounts.escrow_authority.to_account_info(),
+        }, binding);
+
+        let _ = transfer(cpi_ctx, bounty.amount)?;
+
+        // Now, close the escrow token account using a CPI to the token program
+        // The rent will be sent to the maintainer as specified in the context
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.escrow_token_account.to_account_info(),
+                destination: ctx.accounts.maintainer.to_account_info(),
+                authority: ctx.accounts.escrow_authority.to_account_info(),
+            },
+            binding
         );
 
-        bounty.contributor = Some(ctx.accounts.contributor.key());
-        bounty.contributor_github_id = Some(contributor_github_id);
-        bounty.state = BountyState::InProgress;
+        close_account(cpi_ctx)?;
 
-        Ok(())
-    }
-
-    pub fn complete_bounty(ctx: Context<CompleteBounty>) -> Result<()> {
-        let bounty = &mut ctx.accounts.bounty;
-        require!(
-            bounty.state == BountyState::InProgress,
-            BountyError::InvalidBountyState
-        );
-
-        // Transfer tokens from escrow to contributor
-        let transfer_instruction = Transfer {
-            from: ctx.accounts.escrow_token_account.to_account_info(),
-            to: ctx.accounts.contributor_token_account.to_account_info(),
-            authority: bounty.to_account_info(),
-        };
-
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                transfer_instruction,
-                &[&[
-                    b"bounty".as_ref(),
-                    bounty.bounty_id.to_le_bytes().as_ref(),
-                    &[ctx.bumps.bounty],
-                ]],
-            ),
-            bounty.amount,
-        )?;
-
+        emit!(BountyCompleted {
+            bounty_id,
+            contributor: ctx.accounts.contributor.key(),
+            amount: bounty.amount,
+        });
+        
         bounty.state = BountyState::Completed;
-
         Ok(())
     }
+
 
     pub fn cancel_bounty(ctx: Context<CancelBounty>) -> Result<()> {
         let bounty = &mut ctx.accounts.bounty;
-        require!(
-            bounty.state == BountyState::Created || bounty.state == BountyState::InProgress,
-            BountyError::InvalidBountyState
+        let bounty_key = bounty.key();
+        let bump = bounty.bump;
+
+        require!(bounty.state != BountyState::Completed, ContractError::BountyAlreadyCompleted);
+        require!(bounty.state != BountyState::Cancelled, ContractError::BountyAlreadyCancelled);
+        require!(bounty.maintainer == ctx.accounts.maintainer.key(), ContractError::MaintainerMismatch);
+        require!(bounty.mint == ctx.accounts.maintainer_token_account.mint, ContractError::InvalidMint);
+        require!(bounty.mint == ctx.accounts.escrow_token_account.mint, ContractError::InvalidMint);
+    
+    
+        // Seeds for the PDA authority
+        let seeds = &[
+            b"escrow_auth",
+            bounty_key.as_ref(),
+            &[bump]
+        ];
+        let signer = &[&seeds[..]];
+    
+        // First, transfer the tokens from the escrow back to the maintainer
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.escrow_token_account.to_account_info(),
+                to: ctx.accounts.maintainer_token_account.to_account_info(),
+                authority: ctx.accounts.escrow_authority.to_account_info(),
+            },
+            signer
         );
-
-        // Transfer tokens back to maintainer
-        let transfer_instruction = Transfer {
-            from: ctx.accounts.escrow_token_account.to_account_info(),
-            to: ctx.accounts.maintainer_token_account.to_account_info(),
-            authority: bounty.to_account_info(),
-        };
-
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                transfer_instruction,
-                &[&[
-                    b"bounty".as_ref(),
-                    bounty.bounty_id.to_le_bytes().as_ref(),
-                    &[ctx.bumps.bounty],
-                ]],
-            ),
-            bounty.amount,
-        )?;
-
+    
+        transfer(cpi_ctx, bounty.amount)?;
+    
+        // Now, close the escrow token account using a CPI to the token program
+        // The rent will be sent to the maintainer as specified in the context
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.escrow_token_account.to_account_info(),
+                destination: ctx.accounts.maintainer.to_account_info(),
+                authority: ctx.accounts.escrow_authority.to_account_info(),
+            },
+            signer
+        );
+    
+        close_account(cpi_ctx)?;
+    
+        // The bounty account will be closed automatically by Anchor due to its 'close' constraint.
+        // The rent from the bounty account will also go to the maintainer.
+    
+        emit!(BountyCancelled {
+            bounty_id: bounty.bounty_id,
+            maintainer: ctx.accounts.maintainer.key(),
+            amount: bounty.amount,
+        });
+        
         bounty.state = BountyState::Cancelled;
-
+        
         Ok(())
     }
-}
+    pub fn update_admin(ctx: Context<UpdateAdmin>, new_admin: Pubkey) -> Result<()> {
+        // Security checks
+        require!(new_admin != Pubkey::default(), ContractError::InvalidBountyState);
+        require!(new_admin != ctx.accounts.admin.key(), ContractError::InvalidBountyState);
+        
+        let config = &mut ctx.accounts.config;
+        let old_admin = config.admin;
+        config.admin = new_admin; // Update to the new admin key
+        
+        emit!(AdminUpdated {
+            old_admin,
+            new_admin,
+        });
+        
+        Ok(())
+    }
 
-#[derive(Accounts)]
-#[instruction(bounty_id: u64)]
-pub struct InitializeBounty<'info> {
-    #[account(
-        init,
-        payer = maintainer,
-        space = Bounty::LEN,
-        seeds = [b"bounty".as_ref(), bounty_id.to_le_bytes().as_ref()],
-        bump
-    )]
-    pub bounty: Account<'info, Bounty>,
+    pub fn admin_assign_and_release(ctx: Context<AdminAssignAndRelease>, bounty_id: u64) -> Result<()> {
+        let bounty = &mut ctx.accounts.bounty;
 
-    #[account(mut)]
-    pub maintainer: Signer<'info>,
+        // Security checks
+        require!(bounty.bounty_id == bounty_id, ContractError::InvalidBountyState);
+        require!(bounty.mint == ctx.accounts.contributor_token_account.mint, ContractError::InvalidMint);
+        require!(bounty.mint == ctx.accounts.escrow_token_account.mint, ContractError::InvalidMint);
 
-    #[account(
-        mut,
-        associated_token::mint = mint,
-        associated_token::authority = maintainer,
-    )]
-    pub maintainer_token_account: Account<'info, TokenAccount>,
+        // Get the new contributor key
+        let new_contributor_key = ctx.accounts.contributor.key();
+        
 
-    #[account(
-        init,
-        payer = maintainer,
-        associated_token::mint = mint,
-        associated_token::authority = bounty,
-    )]
-    pub escrow_token_account: Account<'info, TokenAccount>,
+        // Override with new contributor (admin super power)
+        bounty.contributor = Some(new_contributor_key);
+        bounty.state = BountyState::InProgress;
+        
+        // Emit event for contributor assignment
+        emit!(ContributorAssigned { bounty_id: bounty.bounty_id, contributor: new_contributor_key });
 
-    pub mint: Account<'info, Mint>,
-    pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
-    pub rent: Sysvar<'info, Rent>,
-}
+        // Release funds from escrow to new contributor
+        let bounty_key = bounty.key();
+        let bump = bounty.bump;
+        let seeds = &[b"escrow_auth", bounty_key.as_ref(), &[bump]];
+        let signer = &[&seeds[..]];
 
-#[derive(Accounts)]
-pub struct AssignContributor<'info> {
-    #[account(
-        mut,
-        has_one = maintainer,
-        seeds = [b"bounty".as_ref(), bounty.bounty_id.to_le_bytes().as_ref()],
-        bump
-    )]
-    pub bounty: Account<'info, Bounty>,
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.escrow_token_account.to_account_info(),
+                to: ctx.accounts.contributor_token_account.to_account_info(),
+                authority: ctx.accounts.escrow_authority.to_account_info(),
+            },
+            signer,
+        );
+        transfer(cpi_ctx, bounty.amount)?;
 
-    #[account(mut)]
-    pub maintainer: Signer<'info>,
+        // Now, close the escrow token account using a CPI to the token program
+        // The rent will be sent to the maintainer as specified in the context
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.escrow_token_account.to_account_info(),
+                destination: ctx.accounts.maintainer.to_account_info(),
+                authority: ctx.accounts.escrow_authority.to_account_info(),
+            },
+            signer
+        );
 
-    /// CHECK: Contributor address is validated in the instruction
-    pub contributor: UncheckedAccount<'info>,
-}
+        close_account(cpi_ctx)?;
 
-#[derive(Accounts)]
-pub struct CompleteBounty<'info> {
-    #[account(
-        mut,
-        has_one = maintainer,
-        constraint = bounty.contributor.unwrap() == contributor.key(),
-        seeds = [b"bounty".as_ref(), bounty.bounty_id.to_le_bytes().as_ref()],
-        bump
-    )]
-    pub bounty: Account<'info, Bounty>,
+        // Emit completion event
+        emit!(BountyCompleted {
+            bounty_id,
+            contributor: new_contributor_key,
+            amount: bounty.amount,
+        });
 
-    #[account(mut)]
-    pub maintainer: Signer<'info>,
+        bounty.state = BountyState::Completed;
+        Ok(())
+    }
+        
 
-    /// CHECK: Contributor is validated in the account constraint
-    pub contributor: UncheckedAccount<'info>,
 
-    pub mint: Account<'info, Mint>,
 
-    #[account(
-        mut,
-        associated_token::mint = mint,
-        associated_token::authority = bounty,
-    )]
-    pub escrow_token_account: Account<'info, TokenAccount>,
-
-    #[account(
-        mut,
-        associated_token::mint = mint,
-        associated_token::authority = contributor,
-    )]
-    pub contributor_token_account: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct CancelBounty<'info> {
-    #[account(
-        mut,
-        has_one = maintainer,
-        seeds = [b"bounty".as_ref(), bounty.bounty_id.to_le_bytes().as_ref()],
-        bump
-    )]
-    pub bounty: Account<'info, Bounty>,
-
-    #[account(mut)]
-    pub maintainer: Signer<'info>,
-
-    pub mint: Account<'info, Mint>,
-
-    #[account(
-        mut,
-        associated_token::mint = mint,
-        associated_token::authority = bounty,
-    )]
-    pub escrow_token_account: Account<'info, TokenAccount>,
-
-    #[account(
-        mut,
-        associated_token::mint = mint,
-        associated_token::authority = maintainer,
-    )]
-    pub maintainer_token_account: Account<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token>,
-}
-
-#[account]
-pub struct Bounty {
-    pub maintainer: Pubkey,
-    pub contributor: Option<Pubkey>,
-    pub amount: u64,
-    pub state: BountyState,
-    pub bounty_id: u64,
-    pub github_issue_id: u64,
-    pub maintainer_github_id: u64,
-    pub contributor_github_id: Option<u64>,
-}
-
-impl Bounty {
-    pub const LEN: usize = 8 + // discriminator
-        32 + // maintainer pubkey
-        33 + // contributor option pubkey
-        8 + // amount
-        1 + // state
-        8 + // bounty_id
-        8 + // github_issue_id
-        8 + // maintainer_github_id
-        9; // contributor_github_id option
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq)]
-pub enum BountyState {
-    Created,
-    InProgress,
-    Completed,
-    Cancelled,
-}
-
-#[error_code]
-pub enum BountyError {
-    #[msg("Invalid bounty state for this operation")]
-    InvalidBountyState,
 }

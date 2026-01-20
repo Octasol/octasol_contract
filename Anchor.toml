@@ -7,11 +7,16 @@ skip-lint = false
 [programs.localnet]
 octasol_contract = "tMf5EmV2h6sMJ2QMFU6766ACJpf7NTuamPzCudaNFus"
 
+[programs.Devnet]
+octasol_contract = "9fEwdooYgtnUje89t6jTtqnfeeJ1e8oNZm6QP67tSksp"
+
+
+
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
+cluster = "Devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]

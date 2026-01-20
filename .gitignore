@@ -5,3 +5,9 @@ target
 node_modules
 test-ledger
 .yarn
+
+
+dist/
+package-lock.json
+tsconfig.tsbuildinfo
+config.bat
